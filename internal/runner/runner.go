@@ -131,25 +131,56 @@ func runScript(scriptPath string, args []string) (string, error) {
 	return stdout.String(), nil
 }
 
+// extractLastErrorMessage extracts the human-readable message from the last
+// ERROR-level log line. Handles both JSON structured logs and the text format
+// emitted by enhanced_logging_config: "DATE - ERROR - [module:func:line] - message".
 func extractLastErrorMessage(raw string) string {
 	var last string
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || line[0] != '{' {
+		if line == "" {
 			continue
 		}
-		var entry struct {
-			Level   string `json:"level"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		// JSON format: {"level": "ERROR", "message": "..."}
+		if line[0] == '{' {
+			var entry struct {
+				Level   string `json:"level"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal([]byte(line), &entry); err == nil &&
+				strings.ToUpper(entry.Level) == "ERROR" && entry.Message != "" {
+				last = entry.Message
+			}
 			continue
 		}
-		if strings.ToUpper(entry.Level) == "ERROR" && entry.Message != "" {
-			last = entry.Message
+		// Text format: "DATE - ERROR - [module:func:line] - message"
+		// Strip ANSI colour codes before parsing.
+		plain := stripANSI(line)
+		parts := strings.SplitN(plain, " - ", 4)
+		if len(parts) == 4 && strings.TrimSpace(parts[1]) == "ERROR" {
+			last = strings.TrimSpace(parts[3])
 		}
 	}
 	return last
+}
+
+// stripANSI removes ANSI escape sequences from s.
+func stripANSI(s string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && s[i] != 'm' {
+				i++
+			}
+			i++ // skip 'm'
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 func extractResultLine(output string) string {

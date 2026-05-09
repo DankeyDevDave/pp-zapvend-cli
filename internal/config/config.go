@@ -216,6 +216,12 @@ func parseDate(s string) time.Time {
 	return time.Time{}
 }
 
+// APIURL returns the Zapvend API base URL from ZAPVEND_API_URL env var.
+// Returns empty string if not set (API recording disabled).
+func APIURL() string {
+	return os.Getenv("ZAPVEND_API_URL")
+}
+
 // Detect tries to find config.yaml from the binary location, then falls back
 // to common known paths. ZAPVEND_CONFIG env var takes priority.
 func Detect() (string, error) {
