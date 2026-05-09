@@ -26,16 +26,14 @@ var vendCmd = &cobra.Command{
 <who> can be a tenant name (partial match) or meter number.
 <rands> is the amount in South African Rand.
 
-When ZAPVEND_API_URL is set, the CLI routes through the Zapvend API so the
-transaction is recorded in the database and notifications are sent. Otherwise
-it calls the automator directly (token generated but not recorded in DB).
+The CLI routes through the Zapvend API (https://zapvend.com by default) so
+the transaction is recorded in the database and notifications are sent.
+Set ZAPVEND_CLI_SECRET to the CLI_SECRET configured in the Zapvend backend.
 
 Examples:
   pp-zapvend-cli vend anita 100
   pp-zapvend-cli vend "Van Passel Main" 200 --demo
-  pp-zapvend-cli vend 07138134767 150 --json
-
-Set ZAPVEND_API_URL=http://localhost:8001 to enable DB recording.`,
+  pp-zapvend-cli vend 07138134767 150 --json`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		who := args[0]
@@ -57,20 +55,20 @@ Set ZAPVEND_API_URL=http://localhost:8001 to enable DB recording.`,
 			demo = false
 		}
 
-		// Try the Zapvend API first — it handles DB recording and notifications.
+		// Route through the Zapvend API (handles DB recording + notifications).
+		// Falls back to direct automator if ZAPVEND_CLI_SECRET is not set or API is unreachable.
 		apiURL := config.APIURL()
-		if apiURL != "" {
-			return vendViaAPI(apiURL, meter, rands, demo)
+		cliSecret := config.CLISecret()
+		if cliSecret == "" {
+			fmt.Fprintln(os.Stderr, "note: ZAPVEND_CLI_SECRET not set — transaction will not be recorded in DB")
+			return vendDirect(meter, rands, demo)
 		}
-
-		// Fallback: call automator directly (no DB recording).
-		fmt.Fprintln(os.Stderr, "note: ZAPVEND_API_URL not set — transaction will not be recorded in DB")
-		return vendDirect(meter, rands, demo)
+		return vendViaAPI(apiURL, cliSecret, meter, rands, demo)
 	},
 }
 
-func vendViaAPI(apiURL string, meter *config.MeterInfo, rands float64, demo bool) error {
-	result, err := runner.GenerateTokenViaAPI(apiURL, meter.MeterNumber, rands, demo, !vendSlow)
+func vendViaAPI(apiURL string, cliSecret string, meter *config.MeterInfo, rands float64, demo bool) error {
+	result, err := runner.GenerateTokenViaAPI(apiURL, cliSecret, meter.MeterNumber, rands, demo, !vendSlow)
 	if err != nil {
 		// If the API is simply not running, fall back gracefully.
 		if isConnRefused(err) {

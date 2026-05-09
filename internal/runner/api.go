@@ -31,7 +31,7 @@ type APIVendResponse struct {
 // a GenerateTokenResult on success, or an error if the API is unreachable or
 // returns a failure. A connection-refused error is returned unwrapped so the
 // caller can distinguish "API down" from "API returned an error".
-func GenerateTokenViaAPI(baseURL string, meter string, rands float64, demoMode bool, fastMode bool) (*GenerateTokenResult, error) {
+func GenerateTokenViaAPI(baseURL string, cliSecret string, meter string, rands float64, demoMode bool, fastMode bool) (*GenerateTokenResult, error) {
 	url := baseURL + "/api/electricity/generate-token"
 
 	body, _ := json.Marshal(APIVendRequest{
@@ -41,8 +41,17 @@ func GenerateTokenViaAPI(baseURL string, meter string, rands float64, demoMode b
 		FastMode:    fastMode,
 	})
 
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cliSecret != "" {
+		req.Header.Set("X-CLI-Secret", cliSecret)
+	}
+
 	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err // connection-level error — API likely not running
 	}
