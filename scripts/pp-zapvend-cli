@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -f /root/.hermes/.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  . /root/.hermes/.env
+  set +a
+fi
+
+if [[ -z "${ZAPVEND_API_URL:-}" ]]; then
+  if [[ -n "${ZAPVEND_PUBLIC_URL:-}" ]]; then
+    export ZAPVEND_API_URL="$ZAPVEND_PUBLIC_URL"
+  elif [[ -n "${ZAPVEND_API_BASE:-}" ]]; then
+    export ZAPVEND_API_URL="$ZAPVEND_API_BASE"
+  fi
+fi
+
+subcommand=""
+for arg in "$@"; do
+  case "$arg" in
+    vend|doctor)
+      subcommand="$arg"
+      break
+      ;;
+  esac
+done
+
+if [[ "$subcommand" == "doctor" && -z "${ZAPVEND_CLI_SECRET:-}" && -n "${ZAPVEND_USERNAME:-}" && -n "${ZAPVEND_PASSWORD:-}" ]]; then
+  python3 - "$@" <<'PY'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+def api_base():
+    base = os.environ.get("ZAPVEND_API_URL") or os.environ.get("ZAPVEND_PUBLIC_URL") or os.environ.get("ZAPVEND_API_BASE") or "https://zapvend.com/api"
+    base = base.rstrip("/")
+    if not base.endswith("/api"):
+        base += "/api"
+    return base
+
+def get(path, token=None):
+    headers = {"User-Agent": UA}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    with urllib.request.urlopen(urllib.request.Request(api_base() + path, headers=headers), timeout=20) as resp:
+        return json.loads(resp.read())
+
+def login():
+    body = urllib.parse.urlencode({
+        "username": os.environ["ZAPVEND_USERNAME"],
+        "password": os.environ["ZAPVEND_PASSWORD"],
+    }).encode()
+    req = urllib.request.Request(
+        api_base() + "/auth/login",
+        data=body,
+        headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())["access_token"]
+
+print("Checking public ZapVend API path...")
+try:
+    with urllib.request.urlopen(urllib.request.Request(api_base().removesuffix("/api") + "/health", headers={"User-Agent": UA}), timeout=10) as resp:
+        print(f"  [OK  ] Health: HTTP {resp.status}")
+    token = login()
+    me = get("/auth/me", token)
+    print(f"  [OK  ] Auth: {me.get('username', 'unknown')} role={me.get('role', 'unknown')}")
+    meters = get("/meters/", token)
+    meter_list = meters.get("meters", meters) if isinstance(meters, dict) else meters
+    print(f"  [OK  ] Meters: {len(meter_list)} available")
+except Exception as exc:
+    print(f"  [FAIL] Public API: {exc}", file=sys.stderr)
+    sys.exit(1)
+print("All public API checks passed.")
+PY
+  exit
+fi
+
+if [[ "$subcommand" == "vend" && -z "${ZAPVEND_CLI_SECRET:-}" ]]; then
+  if [[ -z "${ZAPVEND_USERNAME:-}" || -z "${ZAPVEND_PASSWORD:-}" ]]; then
+    echo "error: neither ZAPVEND_CLI_SECRET nor ZAPVEND_USERNAME/ZAPVEND_PASSWORD is set; refusing to vend before money path" >&2
+    exit 1
+  fi
+  python3 - "$@" <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+def fail(message, json_out=False):
+    if json_out:
+        print(json.dumps({"success": False, "error": message}, indent=2))
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+def api_base():
+    base = os.environ.get("ZAPVEND_API_URL") or os.environ.get("ZAPVEND_PUBLIC_URL") or os.environ.get("ZAPVEND_API_BASE") or "https://zapvend.com/api"
+    base = base.rstrip("/")
+    if not base.endswith("/api"):
+        base += "/api"
+    return base
+
+def parse_time(value):
+    if not value:
+        return None
+    value = str(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+def request_json(path, *, token=None, payload=None, form=None, timeout=30):
+    headers = {"User-Agent": UA}
+    data = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(api_base() + path, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+def login():
+    return request_json(
+        "/auth/login",
+        form={"username": os.environ["ZAPVEND_USERNAME"], "password": os.environ["ZAPVEND_PASSWORD"]},
+        timeout=20,
+    )["access_token"]
+
+def full_name(tenant):
+    parts = [tenant.get("first_name"), tenant.get("middle_name"), tenant.get("last_name")]
+    return " ".join(str(p).strip() for p in parts if p and str(p).strip())
+
+args = sys.argv[1:]
+json_out = "--json" in args
+demo = "--demo" in args or os.environ.get("CYBERVENDIT_DEMO_MODE") == "true"
+if "--force-real" in args:
+    demo = False
+try:
+    vend_index = args.index("vend")
+except ValueError:
+    fail('usage: pp-zapvend-cli vend <who> <rands> [--json] [--demo] [--force-real]', json_out)
+pos = [a for a in args[vend_index + 1:] if not a.startswith("--")]
+if len(pos) < 2:
+    fail('usage: pp-zapvend-cli vend <who> <rands> [--json] [--demo] [--force-real]', json_out)
+who, amount_raw = pos[0], pos[1]
+try:
+    amount = float(amount_raw)
+except ValueError:
+    fail(f"invalid amount {amount_raw!r}: must be a number", json_out)
+if amount <= 0:
+    fail("amount must be greater than 0", json_out)
+
+try:
+    token = login()
+    meters = request_json("/meters/", token=token)
+    meter_list = meters.get("meters", meters) if isinstance(meters, dict) else meters
+    tenants = request_json("/tenants/", token=token)
+    tenant_list = tenants.get("tenants", tenants) if isinstance(tenants, dict) else tenants
+except Exception as exc:
+    fail(f"ZapVend API preflight/auth failed: {exc}", json_out)
+
+tenant_by_id = {t.get("id"): t for t in tenant_list if isinstance(t, dict)}
+query = who.strip().lower()
+matches = []
+for meter in meter_list:
+    if not isinstance(meter, dict):
+        continue
+    tenant = tenant_by_id.get(meter.get("assigned_tenant_id"), {})
+    searchable = " ".join(
+        str(v)
+        for v in [
+            meter.get("meter_number", ""),
+            meter.get("config_user_name_hint", ""),
+            full_name(tenant),
+            tenant.get("address", ""),
+        ]
+        if v
+    ).lower()
+    if str(meter.get("meter_number")) == who or query in searchable:
+        matches.append((meter, tenant))
+
+if not matches:
+    fail(f"no meter found matching {who!r}", json_out)
+if len(matches) > 1 and not any(str(m[0].get("meter_number")) == who for m in matches):
+    names = [f"{m[0].get('meter_number')} {full_name(m[1])}".strip() for m in matches[:5]]
+    fail(f"ambiguous meter query {who!r}: {', '.join(names)}", json_out)
+
+meter, tenant = next((m for m in matches if str(m[0].get("meter_number")) == who), matches[0])
+meter_number = str(meter.get("meter_number"))
+name = full_name(tenant) or meter.get("config_user_name_hint") or meter_number
+last_purchase = parse_time(meter.get("last_purchase_date"))
+started = datetime.now(timezone.utc)
+
+try:
+    calc = request_json(
+        "/electricity/purchases/calculate",
+        token=token,
+        payload={"meter_number": meter_number, "amount": amount},
+        timeout=60,
+    )
+except Exception as exc:
+    fail(f"ZapVend calculate failed before money path: {exc}", json_out)
+
+if demo:
+    result = {
+        "success": True,
+        "demo": True,
+        "meter": meter_number,
+        "name": name,
+        "rands": amount,
+        "kwh": calc.get("totalKwh") or calc.get("total_kwh"),
+        "calculation": calc,
+    }
+    print(json.dumps(result, indent=2) if json_out else f"Demo calculation: {meter_number} {name} R{amount:.2f}")
+    sys.exit(0)
+
+try:
+    execute = request_json(
+        "/electricity/purchases/execute",
+        token=token,
+        payload={"meter_number": meter_number, "amount": amount},
+        timeout=120,
+    )
+except Exception as exc:
+    fail(f"ZapVend execute failed: {exc}", json_out)
+
+verified = None
+for _ in range(12):
+    txns = request_json("/reports/transactions?limit=30", token=token, timeout=30)
+    tx_list = txns.get("transactions", txns) if isinstance(txns, dict) else txns
+    candidates = []
+    for txn in tx_list:
+        if not isinstance(txn, dict) or str(txn.get("meter_number")) != meter_number:
+            continue
+        ts = parse_time(txn.get("timestamp"))
+        if not ts:
+            continue
+        if last_purchase and ts <= last_purchase:
+            continue
+        if ts < started.replace(microsecond=0):
+            continue
+        candidates.append((ts, txn))
+    if candidates:
+        verified = sorted(candidates, key=lambda item: item[0], reverse=True)[0][1]
+        break
+    time.sleep(5)
+
+if not verified:
+    fail(f"ZapVend execute returned {execute!r}, but no fresh DB transaction was found for meter {meter_number}", json_out)
+
+kwh = verified.get("kwh") or verified.get("total_kwh") or calc.get("totalKwh") or calc.get("total_kwh")
+result = {
+    "success": True,
+    "demo": False,
+    "meter": meter_number,
+    "name": name,
+    "rands": verified.get("rand_value") or amount,
+    "kwh": kwh,
+    "token": verified.get("token"),
+    "transaction_id": verified.get("transaction_id"),
+    "vend_id": verified.get("id"),
+    "timestamp": verified.get("timestamp"),
+}
+if json_out:
+    print(json.dumps(result, indent=2))
+else:
+    print(f"Token:  {result['token']}")
+    print(f"Meter:  {meter_number} ({name})")
+    print(f"Amount: R{float(result['rands']):.2f} -> {float(kwh):.4f} kWh")
+    print(f"DB:     vend_id={result['vend_id']} tx={result['transaction_id']} at {result['timestamp']}")
+PY
+  exit
+fi
+
+if [[ "$subcommand" == "vend" ]]; then
+  if [[ -z "${ZAPVEND_CLI_SECRET:-}" ]]; then
+    echo "error: ZAPVEND_CLI_SECRET is not set; refusing direct automator fallback before money path" >&2
+    exit 1
+  fi
+  if [[ -z "${ZAPVEND_CONFIG:-}" ]]; then
+    echo "error: ZAPVEND_CONFIG is not set; refusing direct automator fallback before money path" >&2
+    exit 1
+  fi
+  if [[ ! -f "${ZAPVEND_CONFIG}" ]]; then
+    echo "error: ZAPVEND_CONFIG does not point to a readable file: ${ZAPVEND_CONFIG}" >&2
+    exit 1
+  fi
+fi
+
+exec /root/go/bin/pp-zapvend-cli "$@"
