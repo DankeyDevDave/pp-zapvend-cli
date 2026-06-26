@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/DankeyDevDave/pp-zapvend-cli/internal/config"
 	"github.com/DankeyDevDave/pp-zapvend-cli/internal/runner"
@@ -56,25 +58,43 @@ Examples:
 		}
 
 		// Route through the Zapvend API (handles DB recording + notifications).
-		// Falls back to direct automator if ZAPVEND_CLI_SECRET is not set or API is unreachable.
+		// Production vend must not fall back to the direct automator path: it
+		// bypasses the backend's normal auth/DB/notification path.
 		apiURL := config.APIURL()
 		cliSecret := config.CLISecret()
 		if cliSecret == "" {
-			fmt.Fprintln(os.Stderr, "note: ZAPVEND_CLI_SECRET not set — transaction will not be recorded in DB")
-			return vendDirect(meter, rands, demo)
+			return fmt.Errorf("ZAPVEND_CLI_SECRET is not set; refusing to vend before money path")
+		}
+		if err := preflightAPI(apiURL); err != nil {
+			return err
 		}
 		return vendViaAPI(apiURL, cliSecret, meter, rands, demo)
 	},
 }
 
+func preflightAPI(apiURL string) error {
+	url := healthEndpoint(apiURL)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("Zapvend API preflight failed for %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Zapvend API preflight failed for %s: HTTP %d", url, resp.StatusCode)
+	}
+	return nil
+}
+
+func healthEndpoint(apiURL string) string {
+	base := strings.TrimRight(apiURL, "/")
+	base = strings.TrimSuffix(base, "/api")
+	return base + "/health"
+}
+
 func vendViaAPI(apiURL string, cliSecret string, meter *config.MeterInfo, rands float64, demo bool) error {
 	result, err := runner.GenerateTokenViaAPI(apiURL, cliSecret, meter.MeterNumber, rands, demo, !vendSlow)
 	if err != nil {
-		// If the API is simply not running, fall back gracefully.
-		if isConnRefused(err) {
-			fmt.Fprintf(os.Stderr, "note: Zapvend API at %s is not running — falling back to direct mode (not recorded in DB)\n", apiURL)
-			return vendDirect(meter, rands, demo)
-		}
 		if jsonOut {
 			printJSON(map[string]any{"success": false, "error": err.Error()})
 			os.Exit(1)

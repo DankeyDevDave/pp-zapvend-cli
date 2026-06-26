@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -24,7 +25,7 @@ type APIVendResponse struct {
 	Token       string  `json:"token"`
 	Timestamp   string  `json:"timestamp"`
 	// error path
-	Detail      any     `json:"detail,omitempty"`
+	Detail any `json:"detail,omitempty"`
 }
 
 // GenerateTokenViaAPI calls the Zapvend API's generate-token endpoint. Returns
@@ -32,7 +33,7 @@ type APIVendResponse struct {
 // returns a failure. A connection-refused error is returned unwrapped so the
 // caller can distinguish "API down" from "API returned an error".
 func GenerateTokenViaAPI(baseURL string, cliSecret string, meter string, rands float64, demoMode bool, fastMode bool) (*GenerateTokenResult, error) {
-	url := baseURL + "/api/electricity/generate-token"
+	url := apiEndpoint(baseURL, "/electricity/generate-token")
 
 	body, _ := json.Marshal(APIVendRequest{
 		MeterNumber: meter,
@@ -80,4 +81,12 @@ func GenerateTokenViaAPI(baseURL string, cliSecret string, meter string, rands f
 		Meter:   meter,
 		Demo:    isDemo,
 	}, nil
+}
+
+func apiEndpoint(baseURL string, path string) string {
+	base := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(base, "/api") {
+		return base + path
+	}
+	return base + "/api" + path
 }
